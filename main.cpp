@@ -23,8 +23,8 @@
 
 using namespace std;
 
-namespace servers {
-namespace util {
+namespace httpserver {
+namespace httputil {
 
 
 static const struct table_entry {
@@ -49,7 +49,7 @@ static const struct table_entry {
 	{ NULL, NULL },
 };
 
-char uri_root[512];
+char uri_root[1024];
 
 
 class HTTPServer {
@@ -57,13 +57,32 @@ public:
 
   HTTPServer() {}
   ~HTTPServer() {}
+
   int serv(int port, int nthreads, void *arg);
+
 protected:
+  void ProcessRequest(struct evhttp_request *request, void *arg) const;
+  int BindSocket(int port) const;
+
   static void* Dispatch(void *arg);
   static void GenericHandler(struct evhttp_request *req, void *arg);
-  void ProcessRequest(struct evhttp_request *request, void *arg);
-  int BindSocket(int port);
 
+  static void err_code(struct evhttp_request *req, const int& fd) {
+	evhttp_send_error(req, HTTP_NOTFOUND, "Document was not found");
+	if (fd >= 0)
+		close(fd);
+  }
+
+  static void IsDone(struct evhttp_uri *decoded, char *decoded_path = NULL, char *whole_path = NULL, struct evbuffer *evb = NULL) {
+	  if (decoded)
+	  	evhttp_uri_free(decoded);
+	  if (decoded_path)
+	  	free(decoded_path);
+	  if (whole_path)
+	  	free(whole_path);
+	  if (evb)
+	  	evbuffer_free(evb);
+  }
 
   static const char * guess_content_type(const char *path)
   {
@@ -71,20 +90,18 @@ protected:
   	const struct table_entry *ent;
   	last_period = strrchr(path, '.');
   	if (!last_period || strchr(last_period, '/'))
-  		goto not_found; /* no exension */
+  		return "application/misc"; /* no exension */
   	extension = last_period + 1;
   	for (ent = &content_type_table[0]; ent->extension; ++ent) {
   		if (!evutil_ascii_strcasecmp(ent->extension, extension))
   			return ent->content_type;
   	}
 
-  not_found:
   	return "application/misc";
   }
 
-
   /* Callback used for the /dump URI, and for every non-GET request:
-   * dumps all information to stdout and gives back a trivial 200 ok */
+   * dumps all information to stdout and gives back a trivial HTTP_OK ok */
   static void dump_request_cb(struct evhttp_request *req, void *arg)
   {
   	const char *cmdtype;
@@ -105,8 +122,7 @@ protected:
   	default: cmdtype = "unknown"; break;
   	}
 
-  	printf("Received a %s request for %s\nHeaders:\n",
-  	    cmdtype, evhttp_request_get_uri(req));
+  	printf("Received a %s request for %s\nHeaders:\n", cmdtype, evhttp_request_get_uri(req));
 
   	headers = evhttp_request_get_input_headers(req);
   	for (header = headers->tqh_first; header;
@@ -125,14 +141,14 @@ protected:
   	}
   	puts(">>>");
 
-  	evhttp_send_reply(req, 200, "OK", NULL);
+  	evhttp_send_reply(req, HTTP_OK, "OK", NULL);
   }
-
-
 
 };
 
-int HTTPServer::BindSocket(int port) {
+
+int HTTPServer::BindSocket(int port) const {
+
   int r;
   int nfd;
   nfd = socket(AF_INET, SOCK_STREAM, 0);
@@ -161,6 +177,7 @@ int HTTPServer::BindSocket(int port) {
 }
 
 int HTTPServer::serv(int port, int nthreads, void *arg) {
+
   int r;
   int nfd = BindSocket(port);
   if (nfd < 0) return -1;
@@ -172,7 +189,6 @@ int HTTPServer::serv(int port, int nthreads, void *arg) {
     if (httpd == NULL) return -1;
     r = evhttp_accept_socket(httpd, nfd);
     if (r != 0) return -1;
-    //evhttp_set_gencb(httpd, HTTPServer::GenericHandler, this);
     evhttp_set_gencb(httpd, HTTPServer::GenericHandler, arg);
     r = pthread_create(&ths[i], NULL, HTTPServer::Dispatch, base);
     if (r != 0) return -1;
@@ -189,8 +205,6 @@ void* HTTPServer::Dispatch(void *arg) {
 }
 
 void HTTPServer::GenericHandler(struct evhttp_request *req, void *arg) {
-
-  //((HTTPServer*)arg)->ProcessRequest(req, arg);
 
 	struct evbuffer *evb = NULL;
 	const char *docroot = (char *) arg;
@@ -223,25 +237,31 @@ void HTTPServer::GenericHandler(struct evhttp_request *req, void *arg) {
 	if (!path) path = "/";
 
 	/* We need to decode it, to see what path the user really wanted. */
-	decoded_path = evhttp_uridecode(path, 0, NULL);
-	if (decoded_path == NULL)
-		goto err;
 	/* Don't allow any ".."s in the path, to avoid exposing stuff outside
 	 * of the docroot.  This test is both overzealous and underzealous:
 	 * it forbids aceptable paths like "/this/one..here", but it doesn't
 	 * do anything to prevent symlink following." */
-	if (strstr(decoded_path, ".."))
-		goto err;
+	decoded_path = evhttp_uridecode(path, 0, NULL);
+	if ((decoded_path == NULL) || strstr(decoded_path, "..")) {
+		err_code(req, fd);
+		IsDone(decoded, decoded_path);
+		return;
+	}
 
-	len = strlen(decoded_path)+strlen(docroot)+2;
+	len = strlen(decoded_path) + strlen(docroot)+2;
 	if (!(whole_path =(char*) malloc(len))) {
 		perror("malloc");
-		goto err;
+		err_code(req, fd);
+		IsDone(decoded, decoded_path, whole_path, evb);
+		return;
 	}
+
 	evutil_snprintf(whole_path, len, "%s/%s", docroot, decoded_path);
 
 	if (stat(whole_path, &st)<0) {
-		goto err;
+		err_code(req, fd);
+		IsDone(decoded, decoded_path, whole_path);
+		return;
 	}
 
 	/* This holds the content we're sending. */
@@ -257,8 +277,12 @@ void HTTPServer::GenericHandler(struct evhttp_request *req, void *arg) {
 		if (!strlen(path) || path[strlen(path)-1] != '/')
 			trailing_slash = "/";
 
-		if (!(d = opendir(whole_path)))
-			goto err;
+		if (!(d = opendir(whole_path))) {
+			err_code(req, fd);
+			IsDone(decoded, decoded_path, whole_path, evb);
+			return;
+		}
+
 		evbuffer_add_printf(evb, "<html>\n <head>\n"
 		    "  <title>%s</title>\n"
 		    "  <base href='%s%s%s'>\n"
@@ -287,45 +311,32 @@ void HTTPServer::GenericHandler(struct evhttp_request *req, void *arg) {
 		const char *type = guess_content_type(decoded_path);
 		if ((fd = open(whole_path, O_RDONLY)) < 0) {
 			perror("open");
-			goto err;
+			err_code(req, fd);
+			IsDone(decoded, decoded_path, whole_path, evb);
+			return;
 		}
 
 		if (fstat(fd, &st)<0) {
 			/* Make sure the length still matches, now that we
 			 * opened the file :/ */
 			perror("fstat");
-			goto err;
+			err_code(req, fd);
+			IsDone(decoded, decoded_path, whole_path, evb);
+			return;
 		}
 		evhttp_add_header(evhttp_request_get_output_headers(req),
 		    "Content-Type", type);
 		evbuffer_add_file(evb, fd, 0, st.st_size);
 	}
 
-	evhttp_send_reply(req, 200, "OK", evb);
-	goto done;
-err:
-	evhttp_send_error(req, 404, "Document was not found");
-	if (fd>=0)
-		close(fd);
-done:
-	if (decoded)
-		evhttp_uri_free(decoded);
-	if (decoded_path)
-		free(decoded_path);
-	if (whole_path)
-		free(whole_path);
-	if (evb)
-		evbuffer_free(evb);
+	evhttp_send_reply(req, HTTP_OK, "OK", evb);
+
+	IsDone(decoded, decoded_path, whole_path, evb);
 }
 
-void HTTPServer::ProcessRequest(struct evhttp_request *req, void *arg) {
-  sleep(1);
-/*
-  struct evbuffer *evb = evbuffer_new();
-  if (evb == NULL) return;
-  evbuffer_add_printf(evb, "Requested: %s\n", evhttp_request_uri(req));
-  evhttp_send_reply(req, HTTP_OK, "OK", evb);
-*/
+void HTTPServer::ProcessRequest(struct evhttp_request *req, void *arg) const {
+
+    sleep(1);
 	struct evbuffer *evb = NULL;
 	const char *docroot = (char *) arg;
 	const char *uri = evhttp_request_get_uri(req);
@@ -358,24 +369,25 @@ void HTTPServer::ProcessRequest(struct evhttp_request *req, void *arg) {
 
 	/* We need to decode it, to see what path the user really wanted. */
 	decoded_path = evhttp_uridecode(path, 0, NULL);
-	if (decoded_path == NULL)
-		goto err;
-	/* Don't allow any ".."s in the path, to avoid exposing stuff outside
-	 * of the docroot.  This test is both overzealous and underzealous:
-	 * it forbids aceptable paths like "/this/one..here", but it doesn't
-	 * do anything to prevent symlink following." */
-	if (strstr(decoded_path, ".."))
-		goto err;
+	if ((decoded_path) == NULL || strstr(decoded_path, "..")) {
+		err_code(req, fd);
+		IsDone(decoded, decoded_path);
+		return;
+	}
 
 	len = strlen(decoded_path)+strlen(docroot)+2;
 	if (!(whole_path =(char*) malloc(len))) {
 		perror("malloc");
-		goto err;
+		err_code(req, fd);
+		IsDone(decoded, decoded_path, whole_path);
+		return;
 	}
 	evutil_snprintf(whole_path, len, "%s/%s", docroot, decoded_path);
 
 	if (stat(whole_path, &st)<0) {
-		goto err;
+		err_code(req, fd);
+		IsDone(decoded, decoded_path, whole_path);
+		return;
 	}
 
 	/* This holds the content we're sending. */
@@ -391,8 +403,11 @@ void HTTPServer::ProcessRequest(struct evhttp_request *req, void *arg) {
 		if (!strlen(path) || path[strlen(path)-1] != '/')
 			trailing_slash = "/";
 
-		if (!(d = opendir(whole_path)))
-			goto err;
+		if (!(d = opendir(whole_path))) {
+			err_code(req, fd);
+			IsDone(decoded, decoded_path, whole_path, evb);
+			return;
+		}
 
 		evbuffer_add_printf(evb, "<html>\n <head>\n"
 		    "  <title>%s</title>\n"
@@ -421,42 +436,34 @@ void HTTPServer::ProcessRequest(struct evhttp_request *req, void *arg) {
 		const char *type = guess_content_type(decoded_path);
 		if ((fd = open(whole_path, O_RDONLY)) < 0) {
 			perror("open");
-			goto err;
+			err_code(req, fd);
+			IsDone(decoded, decoded_path, whole_path, evb);
+			return;
 		}
 
 		if (fstat(fd, &st)<0) {
 			/* Make sure the length still matches, now that we
 			 * opened the file :/ */
 			perror("fstat");
-			goto err;
+			err_code(req, fd);
+			IsDone(decoded, decoded_path, whole_path, evb);
+			return;
 		}
 		evhttp_add_header(evhttp_request_get_output_headers(req),
 		    "Content-Type", type);
 		evbuffer_add_file(evb, fd, 0, st.st_size);
 	}
 
-	evhttp_send_reply(req, 200, "OK", evb);
-	goto done;
-err:
-	evhttp_send_error(req, 404, "Document was not found");
-	if (fd>=0)
-		close(fd);
-done:
-	if (decoded)
-		evhttp_uri_free(decoded);
-	if (decoded_path)
-		free(decoded_path);
-	if (whole_path)
-		free(whole_path);
-	if (evb)
-		evbuffer_free(evb);
+	evhttp_send_reply(req, HTTP_OK, "OK", evb);
+
+	IsDone(decoded, decoded_path, whole_path, evb);
 }
 
 }
 }
 
 int main(int argc, char **argv) {
-  servers::util::HTTPServer s;
+  httpserver::httputil::HTTPServer s;
   s.serv(4999, 10, argv[1]);
 }
 
