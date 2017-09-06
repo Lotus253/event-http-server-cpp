@@ -46,6 +46,7 @@ static const struct table_entry {
 	{ "png", "image/png" },
 	{ "pdf", "application/pdf" },
 	{ "ps", "application/postsript" },
+	{ "md", "text/plain" },
 	{ NULL, NULL },
 };
 
